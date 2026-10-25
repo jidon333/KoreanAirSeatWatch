@@ -11,7 +11,7 @@ from . import telegram
 
 
 class Monitor:
-    INTERVAL = 15 * 60
+    INTERVAL = 5 * 60
 
     def __init__(self, path, clock=time.time, config=telegram.config, sender=None):
         self.ledger = Ledger(Path(path))
@@ -22,6 +22,7 @@ class Monitor:
         self.failures = 0
         self.due_at = None
         self.delivery_status = ''
+        self.interval = self.INTERVAL
         # A restarted app waits for the person to resume; pending deliveries survive.
         previous = self.ledger.data.get('monitor', {})
         self.paused = previous.get('active', False) or previous.get('paused', False)
@@ -31,10 +32,10 @@ class Monitor:
             'failures': self.failures, 'due_at': self.due_at}
         atomic_json(self.ledger.path, self.ledger.data)
 
-    def start(self):
+    def start(self, not_before=0):
         with self.lock:
             self.active, self.paused, self.failures = True, False, 0
-            self.due_at = self.clock()
+            self.due_at = max(self.clock(), not_before)
             self.save()
 
     def stop(self, paused=False):
@@ -49,6 +50,13 @@ class Monitor:
                 self.save()
                 return True
             return False
+
+    def discard_pending(self, condition_key):
+        """Removing/editing a route also cancels undelivered alerts for that route."""
+        with self.lock:
+            self.ledger.data['outbox'] = [item for item in self.ledger.pending()
+                                          if item['condition_key'] != condition_key]
+            self.save()
 
     def binding(self):
         cfg = self.config()
@@ -91,8 +99,8 @@ class Monitor:
                 self.ledger.data['outbox'] = [x for x in self.ledger.pending()
                     if x['condition_key'] != condition.key or (x.get('kind') != 'health'
                         and bool(seats) and set(x.get('seat_ids',seats)).issubset(seats))]
-                self.due_at = self.clock() + self.INTERVAL
-                message = '15분 뒤 다시 확인합니다.'
+                self.due_at = self.clock() + self.interval
+                message = f'{self.interval//60}분 뒤 다음 조건을 확인합니다.'
             elif normalized in ('LOGIN_REQUIRED','BLOCKED'):
                 self.stop(paused=True)
                 message = ('로그인이 필요합니다. 대한항공 창에서 로그인한 뒤 자동 확인 재개를 눌러 주세요.'
@@ -102,7 +110,7 @@ class Monitor:
                 self.failures += 1
                 delays = (300, 900) if normalized == 'NETWORK_ERROR' else (900,)
                 if self.failures <= len(delays):
-                    delay = delays[self.failures-1]
+                    delay = max(self.interval, delays[self.failures-1])
                     self.due_at = self.clock() + delay
                     message = f'조회 실패 · {delay//60}분 뒤 재시도합니다 ({self.failures}/{len(delays)}).'
                 else:

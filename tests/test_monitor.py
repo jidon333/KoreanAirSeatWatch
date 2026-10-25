@@ -35,7 +35,7 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(self.monitor.take_due())
         self.assertFalse(self.monitor.take_due())
         self.accept()
-        self.assertEqual(self.monitor.due_at,self.now+900)
+        self.assertEqual(self.monitor.due_at,self.now+300)
 
     def test_failed_queries_preserve_seats_and_pause_requires_explicit_resume(self):
         self.accept()
@@ -119,3 +119,13 @@ class MonitorTests(unittest.TestCase):
         self.accept('LOGIN_REQUIRED')
         self.monitor.flush()
         self.assertEqual(self.send.call_count,1)
+
+    def test_same_flight_in_different_conditions_alerts_independently_and_removal_cancels(self):
+        self.accept()
+        other=Condition('ICN','ORD','2027-01-02','일반석')
+        self.monitor.accept(other,self.result())
+        self.assertEqual(len(self.monitor.ledger.pending()),2)
+        self.monitor.discard_pending(self.condition.key)
+        self.monitor.flush()
+        self.assertEqual(self.send.call_count,1)
+        self.assertIn('2027-01-02',self.send.call_args.args[1])
