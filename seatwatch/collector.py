@@ -44,6 +44,8 @@ def run(session, job):
             visibility:document.visibilityState, text:e.innerText})'''),
             'dialogs': page.get_by_role('dialog').all_text_contents()}
     if job.get('step') == 'focus_browser':
+        from .window import restore_session_window
+        restore_session_window(session)
         cdp = session.context.new_cdp_session(page)
         try:
             window = cdp.send('Browser.getWindowForTarget')
@@ -66,6 +68,8 @@ def run(session, job):
     if (getattr(session,'access_blocked',False) or (ROOT / 'data' / 'access-block.json').exists()) and job.get('step') not in ('booking_snapshot','inspect'):
         return {'state':'BLOCKED','message':'접근 거부 상태입니다. 동일 요청을 반복하지 않습니다.'}
     if job.get('step') == 'submit_saved_login':
+        from .window import restore_session_window
+        restore_session_window(session)
         layer = page.locator('#login-layer')
         layer.get_by_role('button', name='로그인', exact=True).click()
         try:

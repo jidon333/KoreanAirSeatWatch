@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 import re
 import time
 from .session import ROOT, atomic_json
+from .policy import classify_response
 
 
 def public_fields(value, depth=0):
@@ -36,6 +37,7 @@ class Trace:
         self.data = {'at': datetime.now(timezone.utc).isoformat(), 'condition': condition,
                      'responses': [], 'page_error_count': 0}
         self.started = time.monotonic()
+        session.query_failure = None
 
     def response(self, response):
         parsed = urlsplit(response.url)
@@ -53,10 +55,26 @@ class Trace:
                 row['response'] = public_fields(response.json())
             except Exception:
                 row['parse_failed'] = True
-        if response.status in (403, 429):
+        body = ''
+        if 'text/html' in row['content_type']:
+            try:
+                body = response.text()[:8192]
+            except Exception:
+                pass
+        failure = classify_response(response.status, row['content_type'], body)
+        if failure and (not self.session.query_failure or failure.state == 'BLOCKED'):
+            self.session.query_failure = failure
+        if failure and failure.state == 'BLOCKED':
             from .collector import latch_access_denial
             latch_access_denial(self.session, parsed.path, status=response.status)
         self.data['responses'].append(row)
+
+    def request_failed(self, request):
+        parsed = urlsplit(request.url)
+        if parsed.hostname == 'www.koreanair.com' and parsed.path.startswith('/api/ap/booking/avail/'):
+            from .policy import Failure
+            if not self.session.query_failure:
+                self.session.query_failure = Failure('NETWORK_ERROR','대한항공 연결에 실패했습니다.',True)
 
     def error(self, error):
         self.data['page_error_count'] += 1
@@ -64,11 +82,13 @@ class Trace:
     def __enter__(self):
         self.page.on('response', self.response)
         self.page.on('pageerror', self.error)
+        self.page.on('requestfailed', self.request_failed)
         return self
 
     def __exit__(self, *exc):
         self.page.remove_listener('response', self.response)
         self.page.remove_listener('pageerror', self.error)
+        self.page.remove_listener('requestfailed', self.request_failed)
         self.data['exception_type'] = exc[0].__name__ if exc[0] else None
         stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
         atomic_json(ROOT / 'work' / 'diagnostics' / (stamp + '.json'), self.data)

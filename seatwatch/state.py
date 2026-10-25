@@ -28,6 +28,7 @@ class Ledger:
                             '\n'.join(sorted(appeared)) + '\n확인 시각: ' + observation.checked_at +
                             '\n예약 전 대한항공에서 다시 확인해 주세요.',
                     'attempts': 0, 'created_at': observation.checked_at,
+                    'seat_ids': sorted(appeared),
                 })
         atomic_json(self.path, self.data)
 

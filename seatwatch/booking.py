@@ -3,6 +3,7 @@ from dataclasses import asdict
 from datetime import date, datetime, timezone
 import re
 import time
+from playwright.sync_api import Error as PlaywrightError
 from .model import Condition
 from .browser_ui import require_nearby_dates
 from .diagnostics import Trace
@@ -10,6 +11,8 @@ from .session import ROOT, atomic_json
 
 
 def focus(session):
+    from .window import restore_session_window
+    restore_session_window(session)
     cdp = session.context.new_cdp_session(session.page)
     try:
         window = cdp.send('Browser.getWindowForTarget')
@@ -74,6 +77,9 @@ def wait_result(session, heading):
     while time.monotonic() < deadline:
         if getattr(session, 'access_blocked', False):
             return 'BLOCKED'
+        failure = getattr(session, 'query_failure', None)
+        if failure:
+            return failure.state
         if page.locator('#login-layer').is_visible():
             return 'LOGIN_REQUIRED'
         if page.get_by_role('heading', name=heading, exact=True).is_visible():
@@ -82,7 +88,7 @@ def wait_result(session, heading):
     return 'UNVERIFIED'
 
 
-def query(session, values):
+def _query(session, values):
     condition = Condition(**values)
     target = date.fromisoformat(condition.departure)
     if condition.adults != 1:
@@ -140,6 +146,9 @@ def query(session, values):
                 result.update(state=stage, message={'BLOCKED':'접근이 거부되어 자동 조회를 중단했습니다.',
                     'LOGIN_REQUIRED':'대한항공 창에서 로그인한 뒤 다시 조회해 주세요.'}.get(stage, '대한항공에서 정상 결과 화면을 받지 못했습니다. 매진으로 처리하지 않습니다.'))
         result.setdefault('message', '결과를 확정하지 못했습니다.')
+        failure = getattr(session, 'query_failure', None)
+        if failure:
+            result.update(state=failure.state, message=failure.message, rows=[])
         trace.data['outcome'] = result['state']
         result['responses'] = [{k:r[k] for k in ('path','status','method')} for r in trace.data['responses']]
     result['checked_at'] = datetime.now(timezone.utc).isoformat()
@@ -147,3 +156,25 @@ def query(session, values):
     if result['state']=='OK':
         atomic_json(ROOT/'data'/'last-success.json', result)
     return result
+
+
+def query(session, values):
+    session.query_failure = None
+    try:
+        return _query(session, values)
+    except PlaywrightError as exc:
+        failure = getattr(session, 'query_failure', None)
+        if not session.page or session.page.is_closed():
+            state, message = 'CLOSED', '조회 중 대한항공 창이 닫혔습니다.'
+        elif failure:
+            state, message = failure.state, failure.message
+        elif session.page.locator('#login-layer').is_visible():
+            state, message = 'LOGIN_REQUIRED', '로그인이 만료되었습니다. 대한항공 창에서 다시 로그인해 주세요.'
+        elif 'net::ERR_' in str(exc):
+            state, message = 'NETWORK_ERROR', '네트워크 연결을 확인하지 못했습니다.'
+        else:
+            state, message = 'UNVERIFIED', '대한항공 화면에서 조회 결과를 확인하지 못했습니다.'
+        result = {'state':state, 'message':message, 'condition':values, 'rows':[],
+                  'checked_at':datetime.now(timezone.utc).isoformat(), 'nearby':True}
+        atomic_json(ROOT/'data'/'last-attempt.json',result)
+        return result

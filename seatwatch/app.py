@@ -4,11 +4,13 @@ from datetime import datetime, date, timedelta
 import json
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 from .model import Condition
 from .session import ROOT, atomic_json
 from .worker_client import execute
+from .monitor import Monitor
 
 # Airport departure-board palette; one route row leads, results follow.
 COLORS = {'paper':'#F6F8FA', 'ink':'#102B4B', 'muted':'#627388',
@@ -16,7 +18,7 @@ COLORS = {'paper':'#F6F8FA', 'ink':'#102B4B', 'muted':'#627388',
 
 
 class App:
-    def __init__(self, root, executor=execute):
+    def __init__(self, root, executor=execute, monitor=None):
         self.root, self.executor = root, executor
         self.messages = queue.Queue()
         self.busy = False
@@ -26,6 +28,10 @@ class App:
         self.current = None
         self.last_result = None
         self.known = {}
+        self.monitor = monitor or Monitor(ROOT/'data'/'monitor.json')
+        self.notifying = False
+        self.next_notification = 0
+        self.settings = None
         root.title('대한항공 좌석 알림')
         root.geometry('940x700')
         root.minsize(860, 680)
@@ -75,6 +81,7 @@ class App:
         self.search_button.pack(side='left')
         self.monitor_button = ttk.Button(actions,text='15분마다 확인',command=self.toggle_monitor)
         self.monitor_button.pack(side='left',padx=8)
+        ttk.Button(actions,text='텔레그램 연결',command=self.open_telegram).pack(side='right')
         self.status = tk.StringVar(value='조건을 입력하고 조회해 주세요.')
         self.status_label = ttk.Label(wrap,textvariable=self.status,wraplength=760,font=('맑은 고딕',11,'bold'))
         self.status_label.pack(fill='x',pady=(24,8))
@@ -86,7 +93,9 @@ class App:
             self.table.column(key,width=width,anchor='center')
         self.table.tag_configure('available',foreground=COLORS['ok'])
         self.table.pack(fill='both',expand=True)
-        ttk.Label(wrap,text='자동 확인 중 새 좌석은 이 창과 알림음으로 알려드립니다.\n로그인 만료·조회 오류 시 자동 확인을 중단합니다. 예약은 대한항공에서 진행해 주세요.',foreground=COLORS['muted'],font=('맑은 고딕',10)).pack(anchor='w',pady=(16,0))
+        self.notification_status = tk.StringVar(value='텔레그램 연결 상태 확인 중…')
+        ttk.Label(wrap,textvariable=self.notification_status,foreground=COLORS['muted'],font=('맑은 고딕',10)).pack(anchor='w',pady=(16,0))
+        ttk.Label(wrap,text='이 앱과 PC가 켜져 있어야 자동 확인합니다. 로그인 만료 시 재로그인 후 재개해 주세요.\n통신 오류는 제한적으로 재시도하며, 절전에서 돌아오면 밀린 조회는 한 번만 실행합니다.',foreground=COLORS['muted'],font=('맑은 고딕',10)).pack(anchor='w',pady=(6,0))
         try:
             saved=json.loads((ROOT/'data'/'last-success.json').read_text(encoding='utf-8'))
             if saved.get('state')=='OK':
@@ -94,6 +103,8 @@ class App:
         except (OSError, ValueError, KeyError):
             pass
         root.after(150,self.poll)
+        self.update_controls()
+        root.after(1000,self.tick)
 
     def condition(self):
         values={key:var.get().strip() for key,var in self.fields.items()}
@@ -110,7 +121,7 @@ class App:
             field.configure(state='disabled' if locked else ('readonly' if isinstance(field,ttk.Combobox) else 'normal'))
         self.search_button.configure(state='disabled' if locked else 'normal')
         self.browser_button.configure(state='disabled' if self.busy else 'normal')
-        self.monitor_button.configure(text='자동 확인 중지' if self.monitoring else '15분마다 확인',state='disabled' if self.busy and not self.monitoring else 'normal')
+        self.monitor_button.configure(text='자동 확인 중지' if self.monitoring else ('자동 확인 재개' if self.monitor.paused else '15분마다 확인'),state='disabled' if self.busy and not self.monitoring else 'normal')
 
     def dispatch(self,step,payload=None):
         if self.busy:
@@ -140,24 +151,49 @@ class App:
         self.dispatch('query_condition',{'condition':asdict(self.current)})
 
     def open_browser(self):
-        self.stop_monitor()
+        self.stop_monitor(paused=self.monitoring or self.monitor.paused)
         self.status.set('대한항공 창을 여는 중입니다…')
         self.dispatch('focus_browser')
+
+    def open_telegram(self):
+        from .telegram_ui import TelegramSettings
+        if self.settings and not self.settings.closed:
+            self.settings.window.lift()
+        else:
+            self.settings=TelegramSettings(self.root)
 
     def toggle_monitor(self):
         if self.monitoring:
             self.stop_monitor()
             self.status.set('자동 확인을 중지했습니다.'+(' 진행 중인 조회는 마무리합니다.' if self.busy else ''))
         else:
+            self.monitor.start()
             self.monitoring=True
-            self.search()
+            if self.monitor.take_due():
+                self.search()
 
-    def stop_monitor(self):
+    def stop_monitor(self, paused=False):
         self.monitoring=False
+        self.monitor.stop(paused=paused)
         if self.timer:
             self.root.after_cancel(self.timer)
             self.timer=None
         self.update_controls()
+
+    def tick(self):
+        if self.closed:
+            return
+        if not self.busy and self.monitor.take_due():
+            self.search()
+        if not self.notifying and time.time() >= self.next_notification:
+            self.notifying=True
+            def deliver():
+                try:
+                    self.monitor.flush()
+                finally:
+                    self.messages.put(('notification',{},None))
+            threading.Thread(target=deliver,daemon=True).start()
+        self.root.after(1000,self.tick)
 
     def render(self,result,saved=False):
         self.last_result=result
@@ -183,26 +219,35 @@ class App:
         except queue.Empty:
             self.root.after(150,self.poll)
             return
+        if step=='notification':
+            self.notifying=False
+            self.next_notification=time.time()+30
+            self.notification_status.set(self.monitor.delivery_status)
+            self.root.after(150,self.poll)
+            return
         self.busy=False
+        monitoring_message=''
+        if step=='query_condition' and self.monitoring:
+            monitored=result if not error else {'state':'UNVERIFIED','message':error}
+            monitoring_message=self.monitor.accept(self.current,monitored)
+            self.monitoring=self.monitor.active
+            self.next_notification=0
         if error or (step=='query_condition' and result.get('state')!='OK') or (result and result.get('state')=='CLOSED'):
-            self.stop_monitor()
-            self.status.set((error or result.get('message','조회를 확인하지 못했습니다.'))+' · 마지막 정상 결과는 아래에 유지합니다.')
+            self.status.set((monitoring_message or error or result.get('message','조회를 확인하지 못했습니다.'))+' · 마지막 정상 결과는 아래에 유지합니다.')
             self.status_label.configure(foreground=COLORS['error'])
         elif step=='query_condition':
             self.render(result)
             self.status.set(('좌석을 찾았습니다.' if any(r['available'] for r in result['rows']) else '선택한 등급은 매진입니다.')+
-                            (' 15분 뒤 다시 확인합니다.' if self.monitoring else ''))
+                            (' '+monitoring_message if monitoring_message else ''))
             self.status_label.configure(foreground=COLORS['ok'])
-            if self.monitoring:
-                self.timer=self.root.after(15*60*1000,self.search)
         else:
-            self.status.set('대한항공 창을 열었습니다. 필요한 경우 로그인한 뒤 지금 조회를 눌러 주세요.')
+            self.status.set('대한항공 창을 열었습니다. 로그인한 뒤 '+('자동 확인 재개' if self.monitor.paused else '지금 조회')+'를 눌러 주세요.')
         self.update_controls()
         self.root.after(150,self.poll)
 
     def close(self):
         self.closed=True
-        self.stop_monitor()
+        self.stop_monitor(paused=self.monitoring or self.monitor.paused)
         self.root.destroy()
 
 

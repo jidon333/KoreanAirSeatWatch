@@ -16,9 +16,20 @@ PUBLIC_URL = 'https://www.koreanair.com/booking/book-and-manage/award-seat-avail
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + '.tmp')
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    tmp.replace(path)
+    tmp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
+        for attempt in range(6):
+            try:
+                tmp.replace(path)
+                break
+            except PermissionError:
+                # Windows readers/virus scanners can briefly hold the old file.
+                if attempt == 5:
+                    raise
+                time.sleep(.02 * (attempt+1))
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def valid_job(job, worker_id):
@@ -58,6 +69,8 @@ class BrowserSession:
 
     def open_login(self):
         page = self.open()
+        if page.locator('#login-layer').is_visible():
+            return self.status()
         page.get_by_role('button', name='마일리지 예매', exact=True).click()
         return self.status()
 

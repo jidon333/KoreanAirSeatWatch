@@ -53,6 +53,17 @@ class DebugBrowserSession(BrowserSession):
         self.context = self.browser.contexts[0]
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self.page.set_default_timeout(15000)
+        from .window import restore_session_window
+        restore_session_window(self)
+        # Chrome can restore the profile's previous minimized window bounds.
+        cdp = self.context.new_cdp_session(self.page)
+        try:
+            window = cdp.send('Browser.getWindowForTarget')
+            if window['bounds']['windowState'] == 'minimized':
+                cdp.send('Browser.setWindowBounds', {'windowId':window['windowId'], 'bounds':{'windowState':'normal'}})
+        finally:
+            cdp.detach()
+        self.page.bring_to_front()
         self.page.goto(PUBLIC_URL, wait_until='domcontentloaded', timeout=60000)
         dismiss_necessary_cookie_notice(self.page)
         return self.page

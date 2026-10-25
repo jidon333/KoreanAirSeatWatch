@@ -7,6 +7,8 @@ from unittest.mock import patch
 from seatwatch.booking import parse_flights
 from seatwatch.diagnostics import public_fields
 from seatwatch.app import App
+from seatwatch.monitor import Monitor
+from seatwatch.model import Condition
 
 
 class BookingTests(unittest.TestCase):
@@ -35,6 +37,49 @@ class BookingTests(unittest.TestCase):
 
 
 class AppStateTests(unittest.TestCase):
+    def test_auth_pause_unlocks_ui_and_preserves_condition_for_resume(self):
+        with tempfile.TemporaryDirectory() as folder,patch('seatwatch.app.ROOT',Path(folder)):
+            root=tk.Tk()
+            root.withdraw()
+            monitor=Monitor(Path(folder)/'ledger.json',config=lambda:{'enabled':False})
+            app=App(root,monitor=monitor)
+            try:
+                app.current=Condition('ICN','ORD','2026-11-11','일반석')
+                monitor.start()
+                app.monitoring=True
+                app.busy=True
+                app.messages.put(('query_condition',{'state':'LOGIN_REQUIRED'},None))
+                app.poll()
+                self.assertTrue(monitor.paused)
+                self.assertFalse(app.monitoring)
+                self.assertEqual(app.monitor_button.cget('text'),'자동 확인 재개')
+                self.assertEqual(app.current.destination,'ORD')
+                self.assertEqual(str(app.browser_button.cget('state')),'normal')
+            finally:
+                app.close()
+
+    def test_transient_failure_keeps_monitor_active_without_clearing_table(self):
+        with tempfile.TemporaryDirectory() as folder,patch('seatwatch.app.ROOT',Path(folder)):
+            root=tk.Tk()
+            root.withdraw()
+            monitor=Monitor(Path(folder)/'ledger.json',config=lambda:{'enabled':False})
+            app=App(root,monitor=monitor)
+            try:
+                app.current=Condition('ICN','ORD','2026-11-11','일반석')
+                row=app.table.insert('','end',values=('confirmed previous result',))
+                monitor.start()
+                app.monitoring=True
+                app.busy=True
+                app.messages.put(('query_condition',{'state':'NETWORK_ERROR'},None))
+                app.poll()
+                self.assertTrue(app.monitoring)
+                self.assertFalse(app.busy)
+                self.assertIn('5분',app.status.get())
+                self.assertTrue(app.table.exists(row))
+                self.assertEqual(str(app.monitor_button.cget('state')),'normal')
+            finally:
+                app.close()
+
     def test_error_stops_monitoring_and_preserves_last_confirmed_rows(self):
         with tempfile.TemporaryDirectory() as folder, patch('seatwatch.app.ROOT', Path(folder)):
             root=tk.Tk()
