@@ -58,16 +58,27 @@ def choose_date(page, target):
     dialog.wait_for()
     wanted = (target.year, target.month)
     for _ in range(8):
-        months = [(int(y), int(m)) for y,m in re.findall(r'(\d{4})년\s*(\d{1,2})월', dialog.aria_snapshot())]
-        months = list(dict.fromkeys(months))
-        if wanted in months:
-            page.get_by_role('application').nth(months.index(wanted)).get_by_role(
+        # Month labels and accessibility snapshots can update at different times
+        # during the two-month transition. Bind to the actual calendar's month ID.
+        month = page.locator(f'#month{target:%Y%m}')
+        if month.is_visible():
+            month.get_by_role(
                 'button', name=re.compile(r'^'+str(target.day)+r'일,')).click()
             dialog.wait_for(state='hidden')
+            selected = page.get_by_role('button',name=re.compile(r'^출발일 0?'+str(target.month)+r'월 0?'+str(target.day)+r'일 '))
+            if selected.count() != 1:
+                raise RuntimeError('선택된 날짜가 입력 날짜와 다릅니다. 검색 요청을 보내지 않습니다.')
             return
+        ids = page.get_by_role('application').evaluate_all('els=>els.map(e=>e.parentElement.id)')
+        months = [(int(x[5:9]),int(x[9:11])) for x in ids if re.fullmatch(r'month\d{6}',x)]
         if not months:
             raise RuntimeError('날짜 선택 화면의 월을 확인하지 못했습니다.')
         page.get_by_role('button', name='지난 2달' if wanted < months[0] else '다음 2달', exact=True).click()
+        deadline = time.monotonic()+5
+        while page.get_by_role('application').evaluate_all('els=>els.map(e=>e.parentElement.id)') == ids:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('달력의 월 이동을 확인하지 못했습니다.')
+            page.wait_for_timeout(100)
     raise RuntimeError('지원 범위 안의 출발일을 찾지 못했습니다.')
 
 
